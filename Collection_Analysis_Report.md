@@ -551,41 +551,76 @@ Available tasks (* denotes collection defaults):
 
 ## 5. 层级合并规则
 
-### 5.1 配置合并机制
+### 5.1 两种不同的合并场景
 
-配置合并发生在 `task_with_config()` 方法中，当查找任务时会合并路径上所有集合的配置：
+Invoke 中有两种不同的配置合并场景，使用不同的合并策略：
+
+| 场景 | 方法 | 合并策略 | 嵌套字典行为 |
+|------|------|----------|-------------|
+| **同一个 Collection 内部** | `configure()` | `merge_dicts` | **递归合并** |
+| **不同 Collection 层级之间** | `_task_with_merged_config()` | `dict(config, **ours)` | **浅合并（整体替换）** |
+
+### 5.2 场景1：同一个 Collection 内部（递归合并）
+
+当在**同一个 Collection** 上多次调用 `configure()` 时，使用 `merge_dicts` 进行**递归合并**：
 
 ```python
-def task_with_config(
-    self, name: Optional[str]
-) -> Tuple[str, Dict[str, Any]]:
-    # 1. 获取当前集合的配置
-    ours = self.configuration()
-    
-    # 2. 默认任务处理
-    if not name:
-        if not self.default:
-            raise ValueError("This collection has no default task.")
-        return self[self.default], ours
-    
-    # 3. 名称转换
-    name = self.transform(name)
-    
-    # 4. 带点号的路径：递归查找子集合
-    if "." in name:
-        coll, rest = self._split_path(name)
-        return self._task_with_merged_config(coll, rest, ours)
-    
-    # 5. 子集合名：查找子集合的默认任务
-    if name in self.collections:
-        return self._task_with_merged_config(name, "", ours)
-    
-    # 6. 普通任务查找
-    return self.tasks[name], ours
+def configure(self, options: Dict[str, Any]) -> None:
+    merge_dicts(self._configuration, options)
 ```
-*invoke/collection.py:380-414*
+*invoke/collection.py:562-579*
 
-### 5.2 核心合并方法
+`merge_dicts` 的实现（来自 `config.py`）：
+
+```python
+def merge_dicts(
+    base: Dict[str, Any], updates: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Recursively merge dict ``updates`` into dict ``base`` (mutating ``base``.)
+
+    * Values which are themselves dicts will be recursed into.
+    * Values which are a dict in one input and *not* a dict in the other input
+      are irreconciliable and will generate an exception.
+    """
+    for key, value in (updates or {}).items():
+        # Dict values whose keys also exist in 'base' -> recurse
+        if key in base:
+            if isinstance(value, dict):
+                if isinstance(base[key], dict):
+                    merge_dicts(base[key], value)  # 递归合并！
+                else:
+                    raise _merge_error(base[key], value)
+            else:
+                if isinstance(base[key], dict):
+                    raise _merge_error(base[key], value)
+                else:
+                    base[key] = copy.copy(value)
+        else:
+            # New values get set anew
+            if isinstance(value, dict):
+                base[key] = copy_dict(value)
+            else:
+                base[key] = copy.copy(value)
+    return base
+```
+*invoke/config.py:1168-1224*
+
+**递归合并非例**：
+
+```python
+# 同一个 Collection 上多次调用 configure()
+coll = Collection()
+coll.configure({'db': {'host': 'localhost'}})
+coll.configure({'db': {'port': 5432}})
+
+# 结果：嵌套字典递归合并
+# coll.configuration() = {'db': {'host': 'localhost', 'port': 5432}}
+```
+
+### 5.3 场景2：不同 Collection 层级之间（浅合并）
+
+**⚠️ 关键发现**：当通过嵌套路径查找任务时，不同 Collection 层级之间的配置合并使用的是**浅合并**，嵌套字典会被**整体替换**！
 
 ```python
 def _task_with_merged_config(
@@ -593,54 +628,111 @@ def _task_with_merged_config(
 ) -> Tuple[str, Dict[str, Any]]:
     # 递归获取子集合的任务和配置
     task, config = self.collections[coll].task_with_config(rest)
-    # 合并：父集合配置覆盖子集合配置
+    # ⚠️ 浅合并：dict(config, **ours)
     return task, dict(config, **ours)
 ```
 *invoke/collection.py:374-378*
 
-### 5.3 合并规则详解
+**`dict(config, **ours)` 的行为**：
+1. 首先复制 `config`（子集合配置）的所有键值对
+2. 然后用 `ours`（父集合配置）中的键值对**覆盖**相同的键
+3. **对于嵌套字典，这是整体替换，不是递归合并**
 
-**关键代码**：`dict(config, **ours)`
+### 5.4 浅合并示例详解
 
-这表示：
-- `config`：子集合的配置（内层）
-- `ours`：当前集合的配置（外层）
-- **父集合的配置会覆盖子集合的配置**
-
-### 5.4 合并顺序示例
-
-假设有以下嵌套结构和配置：
+假设有以下三层嵌套结构和配置：
 
 ```python
-# 根集合配置
+# 根集合
+root = Collection()
 root.configure({
     'log_level': 'info',
     'timeout': 30,
-    'db': {'host': 'localhost'}
+    'db': {'host': 'localhost'}  # 嵌套字典
 })
 
-# build 子集合配置
+# build 子集合
+build = Collection('build')
 build.configure({
-    'log_level': 'debug',  # 覆盖父级
-    'parallel': 4,         # 新增
-    'db': {'port': 5432}   # 嵌套合并
+    'log_level': 'debug',      # 覆盖父级的顶级字段
+    'parallel': 4,              # 新增顶级字段
+    'db': {'port': 5432}        # 嵌套字典（⚠️ 会被整体替换）
 })
 
-# docs 子集合配置
+# docs 子集合（build 的子集合）
+docs = Collection('docs')
 docs.configure({
-    'log_level': 'warning'  # 覆盖父级
+    'log_level': 'warning',    # 覆盖父级
+    'db': {'user': 'admin'}    # 嵌套字典（⚠️ 会被整体替换）
 })
+
+# 任务
+@task
+def html(c):
+    pass
+docs.add_task(html)
+
+# 组装结构
+build.add_collection(docs)
+root.add_collection(build)
 ```
 
-**调用不同任务时的配置**：
+**调用 `inv build.docs.html` 时的配置合并过程**：
 
-| 任务路径 | 合并后的配置 |
-|----------|-------------|
-| `root_task` | `{'log_level': 'info', 'timeout': 30, 'db': {'host': 'localhost'}}` |
-| `build.compile` | `{'log_level': 'info', 'timeout': 30, 'parallel': 4, 'db': {'host': 'localhost', 'port': 5432}}` |
-| `build.docs.html` | `{'log_level': 'info', 'timeout': 30, 'db': {'host': 'localhost'}}` |
+```
+步骤1：从最内层 docs 开始
+  └── docs.configuration() = {'log_level': 'warning', 'db': {'user': 'admin'}}
 
-### 5.5 配置合并流程图
+步骤2：与 build 合并（浅合并）
+  └── dict({'log_level': 'warning', 'db': {'user': 'admin'}},
+           **{'log_level': 'debug', 'parallel': 4, 'db': {'port': 5432}})
+  └── 结果：{
+           'log_level': 'debug',      # 被 build 覆盖
+           'parallel': 4,              # 来自 build（新增）
+           'db': {'port': 5432}        # ⚠️ 整体替换！'user' 丢失了！
+         }
+
+步骤3：与 root 合并（浅合并）
+  └── dict({'log_level': 'debug', 'parallel': 4, 'db': {'port': 5432}},
+           **{'log_level': 'info', 'timeout': 30, 'db': {'host': 'localhost'}})
+  └── 结果：{
+           'log_level': 'info',       # 被 root 覆盖
+           'parallel': 4,              # 来自 build（保留）
+           'timeout': 30,              # 来自 root（新增）
+           'db': {'host': 'localhost'} # ⚠️ 再次整体替换！'port' 也丢失了！
+         }
+```
+
+### 5.5 合并结果分析
+
+**最终配置（`build.docs.html`）**：
+
+```python
+{
+    'log_level': 'info',          # 来自 root（覆盖了子集合的值）
+    'parallel': 4,                # 来自 build（中间层的顶级字段保留）
+    'timeout': 30,                # 来自 root
+    'db': {'host': 'localhost'}   # 来自 root（嵌套字典只保留最外层）
+}
+```
+
+**关键结论**：
+
+| 字段类型 | 行为 | 示例 |
+|----------|------|------|
+| **顶级字段** | 所有层级的顶级字段都会被保留 | `parallel`（来自 build）、`timeout`（来自 root） |
+| **嵌套字典** | 只保留**最外层**（父集合）的值，中间层丢失 | `db` 只保留 `{'host': 'localhost'}`，`db.port` 和 `db.user` 都丢失了 |
+| **顶级字段冲突** | 父集合的值覆盖子集合的值 | `log_level` 最终为 `'info'`（来自 root） |
+
+### 5.6 不同任务路径的配置对比
+
+| 任务路径 | 合并后的配置 | 说明 |
+|----------|-------------|------|
+| `root_task` | `{'log_level': 'info', 'timeout': 30, 'db': {'host': 'localhost'}}` | 只使用 root 的配置 |
+| `build.compile` | `{'log_level': 'info', 'timeout': 30, 'parallel': 4, 'db': {'host': 'localhost'}}` | `db.port` 丢失！ |
+| `build.docs.html` | `{'log_level': 'info', 'timeout': 30, 'parallel': 4, 'db': {'host': 'localhost'}}` | `db.port` 和 `db.user` 都丢失！ |
+
+### 5.7 配置合并流程图
 
 ```
 调用: inv build.docs.html
@@ -651,7 +743,7 @@ docs.configure({
 └─────────────────────────────────────────┘
         │
         ├── ours = root.configuration()
-        │   {'log_level': 'info', 'timeout': 30}
+        │   {'log_level': 'info', 'timeout': 30, 'db': {'host': 'localhost'}}
         │
         └── name 包含 "." → 递归
             │
@@ -663,7 +755,7 @@ docs.configure({
         ├── 递归调用 build.task_with_config("docs.html")
         │   │
         │   ├── build_ours = build.configuration()
-        │   │   {'log_level': 'debug', 'parallel': 4}
+        │   │   {'log_level': 'debug', 'parallel': 4, 'db': {'port': 5432}}
         │   │
         │   └── 继续递归
         │       │
@@ -675,29 +767,43 @@ docs.configure({
         ├── 递归调用 docs.task_with_config("html")
         │   │
         │   ├── 返回: (html_task, docs.configuration())
-        │   │          {'log_level': 'warning'}
+        │   │          {'log_level': 'warning', 'db': {'user': 'admin'}}
         │   │
-        │   └── 合并: dict(docs_config, **build_ours)
-        │          → {'log_level': 'debug', 'parallel': 4}
+        │   └── 浅合并: dict(docs_config, **build_ours)
+        │          → {'log_level': 'debug', 'parallel': 4, 'db': {'port': 5432}}
+        │          ⚠️ 'db.user' 丢失了！
         │
-        └── 合并: dict(build_merged_config, **root_ours)
-               → {'log_level': 'info', 'timeout': 30, 'parallel': 4}
+        └── 浅合并: dict(build_merged_config, **root_ours)
+               → {'log_level': 'info', 'timeout': 30, 'parallel': 4, 'db': {'host': 'localhost'}}
+               ⚠️ 'db.port' 也丢失了！
 ```
 
-### 5.6 嵌套字典的合并
+### 5.8 重要提示
 
-`configure()` 方法使用 `merge_dicts()` 进行递归合并：
+**如果需要在不同层级之间共享嵌套配置**，应该：
+
+1. **只在根集合定义嵌套配置**，子集合不要覆盖
+2. **或者使用顶级字段**（非嵌套字典）来传递配置
+3. **避免在不同层级定义相同键的嵌套字典**
+
+**示例（推荐做法）**：
 
 ```python
-def configure(self, options: Dict[str, Any]) -> None:
-    merge_dicts(self._configuration, options)
-```
-*invoke/collection.py:562-579*
+# 推荐：只在根集合定义嵌套配置
+root.configure({'db': {'host': 'localhost', 'port': 5432, 'user': 'admin'}})
 
-**merge_dicts 的行为**：
-- 对于普通键：新值覆盖旧值
-- 对于字典值：递归合并
-- 这意味着子集合的嵌套配置会与父集合的嵌套配置合并
+# 子集合使用顶级字段，不覆盖嵌套字典
+build.configure({'parallel': 4, 'log_level': 'debug'})
+docs.configure({'log_level': 'warning'})
+
+# 结果：所有层级都能访问完整的 db 配置
+# build.docs.html 的配置 = {
+#     'log_level': 'info',
+#     'parallel': 4,
+#     'timeout': 30,
+#     'db': {'host': 'localhost', 'port': 5432, 'user': 'admin'}  # 完整！
+# }
+```
 
 ---
 
