@@ -754,7 +754,418 @@ def list_json(self) -> None:
 | **如何切换到子集合？** | `inv --list <namespace>` 时，通过 `subcollection_from_path()` 递归查找子集合，然后更新 `self.scoped_collection = sub` |
 | **对输出范围的影响？** | 所有输出方法都从 `scoped_collection` 开始递归，只显示该集合及其子集合的任务；任务名格式会添加前导点表示相对路径 |
 
-### 4.3 支持的输出格式
+---
+
+### 4.3 list_depth：控制输出树的截断深度
+
+**⚠️ 重要概念**：`list_depth`（对应命令行参数 `--list-depth`）控制输出树的**深度**，超过指定深度的子集合会被**截断**并显示为摘要。
+
+本节将回答以下问题：
+
+1. **命令行选项如何传递？**
+2. **截断逻辑的具体判定方式？**
+3. **三种输出格式下是否有差异？**
+
+---
+
+#### 问题1：命令行选项如何传递？
+
+**答案**：通过 `self.args["list-depth"].value` 解析命令行参数，并赋值给 `self.list_depth`。
+
+让我们追踪完整的传递路径：
+
+##### 步骤1：Program 初始化
+
+在 `Program.__init__` 中，`list_depth` 被初始化为 `None`：
+
+```python
+# Program.__init__ 中的初始化
+self.list_root: Optional[str] = None
+self.list_depth: Optional[int] = None  # 默认值为 None（不限制深度）
+self.list_format = "flat"
+self.scoped_collection = self.collection
+```
+*invoke/program.py:483-486*
+
+##### 步骤2：命令行参数解析
+
+在参数解析阶段，`--list-depth` 选项的值被读取：
+
+```python
+# 解析命令行参数
+list_root = self.args.list.value  # will be True or string
+self.list_format = self.args["list-format"].value
+self.list_depth = self.args["list-depth"].value  # ⚠️ 读取 --list-depth 的值
+```
+*invoke/program.py:517-519*
+
+**关键点**：
+- `list_depth` 的类型是 `Optional[int]`
+- 默认值是 `None`（表示不限制深度）
+- 当用户指定 `--list-depth N` 时，`list_depth` 被设置为整数 `N`
+
+##### 完整传递路径
+
+```
+用户输入: inv --list --list-depth 2
+        │
+        ▼
+1. 命令行参数解析
+   └── self.args["list-depth"].value = 2
+        │
+        ▼
+2. 赋值给 Program 属性
+   └── self.list_depth = 2
+        │
+        ▼
+3. 在 _make_pairs() 中使用
+   └── truncate = self.list_depth and (len(ancestors) + 1) >= self.list_depth
+```
+
+---
+
+#### 问题2：截断逻辑的具体判定方式？
+
+**答案**：截断逻辑由 `_make_pairs()` 中的 `truncate` 变量控制，当当前层级**大于等于** `list_depth` 时触发截断。
+
+让我们详细分析截断逻辑：
+
+##### 核心判定公式
+
+```python
+# Determine whether we're at max-depth or not
+truncate = self.list_depth and (len(ancestors) + 1) >= self.list_depth
+```
+*invoke/program.py:870*
+
+**公式解析**：
+
+| 部分 | 含义 |
+|------|------|
+| `self.list_depth` | 用户指定的深度限制（默认 `None` 表示不限制） |
+| `len(ancestors) + 1` | 当前层级（从 `scoped_collection` 开始计算） |
+| `>= self.list_depth` | 当前层级是否大于等于限制深度 |
+
+**层级计算方式**：
+
+- `ancestors` 是祖先集合的名称列表
+- 根集合（`scoped_collection`）的 `ancestors = []`，所以层级是 `0 + 1 = 1`
+- 第一层子集合的 `ancestors = ["build"]`，所以层级是 `1 + 1 = 2`
+- 第二层子集合的 `ancestors = ["build", "docs"]`，所以层级是 `2 + 1 = 3`
+
+##### 截断行为详解
+
+当 `truncate = True` 时，会发生以下行为：
+
+```python
+if truncate:
+    # 1. 计算摘要信息
+    tallies = [
+        "{} {}".format(len(getattr(subcoll, attr)), attr)
+        for attr in ("tasks", "collections")
+        if getattr(subcoll, attr)
+    ]
+    # 2. 添加摘要到显示名称
+    displayname += " [{}]".format(", ".join(tallies))
+```
+*invoke/program.py:875-881*
+
+**摘要格式**：
+- 如果子集合有 2 个任务和 1 个子集合 → `[2 tasks, 1 collections]`
+- 如果子集合只有 3 个任务 → `[3 tasks]`
+- 如果子集合只有 2 个子集合 → `[2 collections]`
+
+##### 递归控制
+
+当 `truncate = True` 时，**不会**递归处理子集合：
+
+```python
+# Recurse, if not already at max depth
+if not truncate:
+    recursed_pairs = self._make_pairs(
+        coll=subcoll, ancestors=ancestors + [name]
+    )
+    pairs.extend(recursed_pairs)
+```
+*invoke/program.py:888-892*
+
+**关键点**：
+- 当 `truncate = True` 时，跳过递归
+- 超过深度的子集合只显示名称和摘要，不显示其中的任务和子集合
+
+##### 完整示例分析
+
+假设任务结构如下：
+
+```
+root (层级 1)
+├── test (任务)
+└── build (子集合，层级 2)
+    ├── compile (任务)
+    └── docs (子集合，层级 3)
+        └── html (任务)
+```
+
+**场景1：`inv --list --list-depth 1`**
+
+- `list_depth = 1`
+- `truncate` 的计算：
+  - 根集合：`len(ancestors) + 1 = 0 + 1 = 1`，`1 >= 1` → `truncate = True`
+  - 但根集合没有祖先，所以它自己的任务会被显示
+  - 子集合 `build` 的层级是 `2`，`2 >= 1` → `truncate = True`
+
+**输出**：
+```
+Available tasks:
+
+  test                       Run tests
+  build [2 tasks, 1 collections]  Build-related tasks
+```
+
+**说明**：
+- `test` 是根集合的任务，正常显示
+- `build` 被截断，显示为 `[2 tasks, 1 collections]`
+- `compile`、`docs`、`html` 都不显示
+
+**场景2：`inv --list --list-depth 2`**
+
+- `list_depth = 2`
+- `truncate` 的计算：
+  - 根集合：`1 >= 2` → `False`
+  - `build`：`2 >= 2` → `True`
+  - `docs`：`3 >= 2` → `True`（但不会被递归到）
+
+**输出**：
+```
+Available tasks:
+
+  test                       Run tests
+  build.compile (build.c)   Compile the project
+  docs [1 tasks, 0 collections]  Documentation tasks
+```
+
+**说明**：
+- `test` 正常显示
+- `build.compile` 正常显示（层级 2 等于限制，但它是任务）
+- `docs` 被截断，显示为 `[1 tasks, 0 collections]`
+- `html` 不显示
+
+**场景3：`inv --list --list-depth 3`（或不限制）**
+
+- `list_depth = 3` 或 `None`
+- `truncate` 的计算：
+  - 根集合：`1 >= 3` → `False`
+  - `build`：`2 >= 3` → `False`
+  - `docs`：`3 >= 3` → `True`
+
+**输出**：
+```
+Available tasks:
+
+  test                       Run tests
+  build.compile (build.c)   Compile the project
+  build.docs.html (build.docs)  Build HTML docs
+```
+
+**说明**：
+- 所有任务都正常显示
+- `list_depth = 3` 时，`docs` 的层级等于限制，但它的任务 `html` 会被显示
+- 如果 `list_depth = None`（默认），不会有任何截断
+
+##### 与 scoped_collection 的配合
+
+当 `scoped_collection` 被设置为子集合时，**层级是从 `scoped_collection` 开始计算**的：
+
+**示例**：`inv --list build --list-depth 1`
+
+- `scoped_collection = build`
+- `list_depth = 1`
+- 层级计算：
+  - `build` 本身：`len(ancestors) + 1 = 0 + 1 = 1`
+  - `docs`：`len(ancestors) + 1 = 1 + 1 = 2`
+
+**输出**：
+```
+Available tasks:
+
+  .compile (.c)             Compile the project
+  .docs [1 tasks, 0 collections]  Documentation tasks
+```
+
+**说明**：
+- `.compile` 是 `build` 的任务，正常显示
+- `.docs` 被截断，显示为 `[1 tasks, 0 collections]`
+- `.html` 不显示
+
+---
+
+#### 问题3：三种输出格式下是否有差异？
+
+**答案**：**有差异**。`list_depth` 在三种输出格式下的行为不同：
+
+| 格式 | 对 list_depth 的支持 | 行为 |
+|------|---------------------|------|
+| `flat` | 支持 | 截断时显示子集合摘要 |
+| `nested` | 支持 | 截断时显示子集合摘要 |
+| `json` | **不支持** | 直接报错退出 |
+
+让我们详细分析每种格式：
+
+##### 格式1：JSON 格式（不支持）
+
+`list_json()` 方法会检查是否设置了 `list_depth`，如果设置了则**直接报错**：
+
+```python
+def list_json(self) -> None:
+    # Sanity: we can't cleanly honor the --list-depth argument without
+    # changing the data schema or otherwise acting strangely; and it also
+    # doesn't make a ton of sense to limit depth when the output is for a
+    # script to handle. So we just refuse, for now. TODO: find better way
+    if self.list_depth:
+        raise Exit(
+            "The --list-depth option is not supported with JSON format!"
+        )  # noqa
+    # ... 正常输出 JSON
+    coll = self.scoped_collection
+    data = coll.serialized()
+    print(json.dumps(data))
+```
+*invoke/program.py:895-909*
+
+**错误信息**：
+```
+Error: The --list-depth option is not supported with JSON format!
+```
+
+**原因说明**（从注释中可以看到）：
+1. JSON 输出的数据结构难以优雅地表示"截断"
+2. JSON 输出通常是给脚本处理的，限制深度意义不大
+3. 暂时没有找到更好的实现方式
+
+##### 格式2：Flat 格式（支持）
+
+`list_flat()` 调用 `_make_pairs()`，但只有在**截断时**才会显示子集合：
+
+```python
+# 在 _make_pairs() 中
+if self.list_format == "nested":
+    pairs.append((indent + displayname, helpline(subcoll)))
+elif self.list_format == "flat" and truncate:  # ⚠️ 只有截断时才添加
+    # NOTE: only adding coll-oriented pair if limiting by depth
+    pairs.append((ancestor_path + displayname, helpline(subcoll)))
+```
+*invoke/program.py:882-886*
+
+**关键点**：
+- Flat 格式**不截断时**：直接显示子集合内的任务，不显示子集合本身
+- Flat 格式**截断时**：显示被截断的子集合名称和摘要
+
+**示例对比**：
+
+**`inv --list --list-depth 1`（截断）**：
+```
+Available tasks:
+
+  test                       Run tests
+  build [2 tasks, 1 collections]  Build-related tasks
+```
+
+**`inv --list`（不截断）**：
+```
+Available tasks:
+
+  build.compile (build.c)   Compile the project
+  build.docs.html (build.docs)  Build HTML docs
+  test                       Run tests
+```
+
+**差异**：
+- 截断时：`build` 被显示为摘要 `[2 tasks, 1 collections]`
+- 不截断时：`build` 不显示，直接显示 `build.compile` 和 `build.docs.html`
+
+##### 格式3：Nested 格式（支持）
+
+`list_nested()` 调用 `_make_pairs()`，**无论是否截断**都会显示子集合：
+
+```python
+# 在 _make_pairs() 中
+if self.list_format == "nested":
+    pairs.append((indent + displayname, helpline(subcoll)))  # ⚠️ 总是添加
+elif self.list_format == "flat" and truncate:
+    # NOTE: only adding coll-oriented pair if limiting by depth
+    pairs.append((ancestor_path + displayname, helpline(subcoll)))
+```
+*invoke/program.py:882-886*
+
+**关键点**：
+- Nested 格式**截断时**：显示子集合名称和摘要
+- Nested 格式**不截断时**：显示子集合名称，然后递归显示其内容
+
+**示例对比**：
+
+**`inv --list --list-depth 1`（截断）**：
+```
+Available tasks (* denotes collection defaults):
+
+  test*                      Run tests
+  build [2 tasks, 1 collections]  Build-related tasks
+```
+
+**`inv --list`（不截断）**：
+```
+Available tasks (* denotes collection defaults):
+
+  test*                      Run tests
+  build                      Build-related tasks
+    compile (c)              Compile the project
+    docs                     Documentation tasks
+      html*                  Build HTML docs
+```
+
+**差异**：
+- 截断时：`build` 显示为 `[2 tasks, 1 collections]`，不显示子内容
+- 不截断时：`build` 正常显示，子内容缩进显示
+
+##### 三种格式对比总结
+
+| 行为 | Flat 格式 | Nested 格式 | JSON 格式 |
+|------|-----------|-------------|-----------|
+| 是否支持 `list_depth` | 是 | 是 | **否（报错）** |
+| 截断时显示子集合 | 是（摘要） | 是（摘要） | 不适用 |
+| 不截断时显示子集合 | **否**（直接显示子任务） | **是**（显示子集合名） | 是（完整结构） |
+| 任务名格式 | 完整路径 | 缩进层级 | 嵌套结构 |
+
+**Flat vs Nested 在不截断时的关键差异**：
+
+**Flat 格式**：
+```
+build.compile (build.c)   Compile the project
+build.docs.html (build.docs)  Build HTML docs
+```
+
+**Nested 格式**：
+```
+build                      Build-related tasks
+  compile (c)              Compile the project
+  docs                     Documentation tasks
+    html*                  Build HTML docs
+```
+
+**差异原因**：
+- Flat 格式的设计目标是**扁平列表**，显示完整路径方便用户复制
+- Nested 格式的设计目标是**树状结构**，显示层级关系方便用户理解
+
+---
+
+#### 本节核心结论
+
+| 问题 | 答案 |
+|------|------|
+| **命令行选项如何传递？** | `self.list_depth = self.args["list-depth"].value`，默认值为 `None`（不限制深度） |
+| **截断逻辑的具体判定方式？** | `truncate = self.list_depth and (len(ancestors) + 1) >= self.list_depth`，层级从 `scoped_collection` 开始计算；截断时显示 `[N tasks, M collections]` 摘要，不递归显示子内容 |
+| **三种输出格式下是否有差异？** | **有差异**：JSON 格式直接报错；Flat 格式只有截断时才显示子集合；Nested 格式无论是否截断都显示子集合 |
+
+### 4.4 支持的输出格式
 
 | 格式 | 方法 | 说明 |
 |------|------|------|
