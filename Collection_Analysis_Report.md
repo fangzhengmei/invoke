@@ -415,7 +415,346 @@ def list_tasks(self) -> None:
 ```
 *invoke/program.py:807-815*
 
-### 4.2 支持的输出格式
+### 4.2 scoped_collection：控制输出树的范围
+
+**⚠️ 关键概念**：`scoped_collection` 直接决定了 `inv --list` 输出树的**起点和范围**。本节将清晰回答三个问题：
+
+1. **默认值是什么？**
+2. **`inv --list <名称>` 时如何切换到子集合？**
+3. **对输出树范围有什么影响？**
+
+---
+
+#### 问题1：scoped_collection 的默认值是什么？
+
+**答案**：默认值是 `self.collection`，即整个任务树的**根集合**。
+
+从 `Program.__init__` 的代码可以看到：
+
+```python
+# Program 初始化时
+self.scoped_collection = self.collection  # 默认指向根集合
+```
+*invoke/program.py:486*
+
+**`self.collection` 是什么？**
+
+`self.collection` 是 `Program` 类中存储**整个任务树**的根 Collection。它通过 `Loader` 从 `tasks.py` 模块加载：
+
+```python
+# Program 中 collection 的来源（简化）
+self.collection = self.loader.load_collection(...)
+```
+
+**关键点总结**：
+
+| 属性 | 默认值 | 含义 |
+|------|--------|------|
+| `self.scoped_collection` | `self.collection` | `inv --list` 输出的起始集合 |
+| `self.collection` | 从 `tasks.py` 加载的根 Collection | 整个任务树的根 |
+
+**这意味着**：
+- 默认情况下，`inv --list` 会从**根集合**开始，显示**所有任务**
+- 所有列表输出方法（`list_flat()`, `list_nested()`, `list_json()`）都使用 `self.scoped_collection` 作为递归起点
+
+---
+
+#### 问题2：`inv --list <名称>` 时如何切换到子集合？
+
+**答案**：当使用 `inv --list <namespace>` 形式时，会通过 `subcollection_from_path()` 方法找到对应的子集合，并更新 `scoped_collection`。
+
+让我们追踪完整的代码流程：
+
+##### 步骤1：处理 `--list` 参数
+
+从 `program.py` 的参数处理逻辑：
+
+```python
+# 处理 --list 参数的逻辑
+if list_root:
+    if isinstance(list_root, str):
+        # 1. 保存 list_root 值（用于显示格式）
+        self.list_root = list_root
+        try:
+            # 2. 通过路径获取子集合
+            sub = self.collection.subcollection_from_path(list_root)
+            # 3. ⚠️ 更新 scoped_collection！
+            self.scoped_collection = sub
+        except KeyError:
+            msg = "Sub-collection '{}' not found!"
+            raise Exit(msg.format(list_root))
+    # 4. 调用 list_tasks() 输出
+    self.list_tasks()
+```
+*invoke/program.py:520-530*
+
+##### 步骤2：`subcollection_from_path()` 方法
+
+这个方法负责**递归查找子集合**：
+
+```python
+def subcollection_from_path(self, path: str) -> "Collection":
+    # 1. 按点号分割路径
+    parts = path.split(".")
+    collection = self
+    # 2. 逐级查找子集合
+    while parts:
+        # 从 collections 字典中获取子集合
+        collection = collection.collections[parts.pop(0)]
+    return collection
+```
+*invoke/collection.py:346-356*
+
+##### 完整执行流程图
+
+以 `inv --list build.docs` 为例：
+
+```
+用户输入: inv --list build.docs
+        │
+        ▼
+┌─────────────────────────────────────────┐
+│ 1. list_root = "build.docs"             │
+│    (从命令行参数解析)                     │
+└─────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────┐
+│ 2. self.list_root = "build.docs"        │
+│    (保存用于显示格式)                     │
+└─────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────┐
+│ 3. self.collection.subcollection_from_path("build.docs")│
+│    ├── parts = ["build", "docs"]       │
+│    ├── 第一循环: collection = root.collections["build"] │
+│    └── 第二循环: collection = build.collections["docs"] │
+│    返回: docs 子集合                     │
+└─────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────┐
+│ 4. self.scoped_collection = docs        │
+│    ⚠️ 关键：scoped_collection 被更新了！  │
+└─────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────┐
+│ 5. 调用 list_tasks()                    │
+│    focus = self.scoped_collection = docs│
+│    从 docs 开始输出任务树                 │
+└─────────────────────────────────────────┘
+```
+
+**关键点**：
+- `scoped_collection` 被更新为 `docs` 子集合
+- `list_tasks()` 中的 `focus = self.scoped_collection` 现在指向 `docs`
+- 所有输出方法都会从 `docs` 开始递归
+
+---
+
+#### 问题3：对输出树范围有什么影响？
+
+**答案**：`scoped_collection` 决定了输出树的**起点**，所有输出方法都会从这个集合开始递归。
+
+让我们用一个具体的任务结构来对比不同参数的输出：
+
+**假设任务结构**：
+
+```
+root (Collection)
+├── tasks:
+│   └── test (Task)
+└── collections:
+    └── build (Collection)
+        ├── tasks:
+        │   └── compile (Task, aliases=['c'])
+        └── collections:
+            └── docs (Collection)
+                └── tasks:
+                    └── html (Task, default=True)
+```
+
+---
+
+##### 场景1：`inv --list`（默认值）
+
+**scoped_collection**：`root`（根集合）
+
+**list_flat() 输出**：
+```
+Available tasks:
+
+  build.compile (build.c)   Compile the project
+  build.docs.html (build.docs)  Build HTML docs
+  test                       Run tests
+
+Default task: test
+```
+
+**list_nested() 输出**：
+```
+Available tasks (* denotes collection defaults):
+
+  test*                      Run tests
+  build                      Build-related tasks
+    compile (c)              Compile the project
+    docs                     Documentation tasks
+      html*                  Build HTML docs
+```
+
+**说明**：
+- 从 `root` 开始递归
+- 显示**所有任务**和子集合
+- Flat 格式显示完整路径：`build.compile`, `build.docs.html`
+- Nested 格式显示缩进层级
+
+---
+
+##### 场景2：`inv --list build`
+
+**scoped_collection**：`build` 子集合
+
+**list_flat() 输出**：
+```
+Available tasks:
+
+  .compile (.c)             Compile the project
+  .docs.html (.docs)        Build HTML docs
+```
+
+**list_nested() 输出**：
+```
+Available tasks (* denotes collection defaults):
+
+  .compile (.c)             Compile the project
+  .docs                     Documentation tasks
+    .html*                  Build HTML docs
+```
+
+**与场景1的关键区别**：
+
+| 维度 | `inv --list` | `inv --list build` |
+|------|-------------|-------------------|
+| 起始集合 | `root` | `build` |
+| 显示范围 | 所有任务 | 只显示 `build` 及其子集合 |
+| 任务名格式 | `build.compile`（完整路径） | `.compile`（前导点表示从当前命名空间开始） |
+| 别名格式 | `build.c` | `.c` |
+
+**为什么任务名前有 `.`？**
+
+因为设置了 `self.list_root = "build"`，`_make_pairs()` 中的逻辑：
+
+```python
+# 在 _make_pairs 中
+if ancestors or self.list_root:
+    displayname = ".{}".format(displayname)  # 添加前导点
+    aliases = [".{}".format(x) for x in aliases]
+```
+*invoke/program.py:845-847*
+
+**前导点的含义**：表示这个任务名是**相对于当前命名空间**的，调用时需要使用完整路径（如 `inv build.compile`）或从对应命名空间调用。
+
+---
+
+##### 场景3：`inv --list build.docs`
+
+**scoped_collection**：`docs` 子集合
+
+**list_flat() 输出**：
+```
+Available tasks:
+
+  .html (.build.docs)       Build HTML docs
+```
+
+**list_nested() 输出**：
+```
+Available tasks (* denotes collection defaults):
+
+  .html*                    Build HTML docs
+```
+
+**与场景2的关键区别**：
+
+| 维度 | `inv --list build` | `inv --list build.docs` |
+|------|-------------------|------------------------|
+| 起始集合 | `build` | `docs` |
+| 显示范围 | `build` 的任务 + `docs` 的任务 | 只显示 `docs` 的任务 |
+| 任务名格式 | `.compile`, `.docs.html` | `.html` |
+
+---
+
+##### 对比总结表
+
+| 命令 | scoped_collection | 输出的任务 | 任务名格式 |
+|------|-------------------|-------------|-----------|
+| `inv --list` | `root` | `test`, `build.compile`, `build.docs.html` | `test`, `build.compile`, `build.docs.html` |
+| `inv --list build` | `build` | `compile`, `docs.html` | `.compile`, `.docs.html` |
+| `inv --list build.docs` | `docs` | `html` | `.html` |
+
+---
+
+#### 扩展：与其他参数的配合
+
+`scoped_collection` 还会与其他参数配合使用：
+
+##### 与 `--list-depth` 的配合
+
+`list_depth` 控制输出树的**深度**，与 `scoped_collection` 配合使用时，深度是**从 `scoped_collection` 开始计算**的：
+
+```python
+truncate = self.list_depth and (len(ancestors) + 1) >= self.list_depth
+if truncate:
+    # 到达最大深度，显示摘要
+    tallies = [
+        "{} {}".format(len(getattr(subcoll, attr)), attr)
+        for attr in ("tasks", "collections")
+        if getattr(subcoll, attr)
+    ]
+    displayname += " [{}]".format(", ".join(tallies))
+```
+*invoke/program.py:870-881*
+
+**示例对比**：
+
+| 命令 | 输出 | 说明 |
+|------|------|------|
+| `inv --list --list-depth 1` | `test`, `build [2 tasks, 1 collections]` | 从 `root` 开始，深度1 |
+| `inv --list build --list-depth 1` | `.compile`, `.docs [1 tasks, 0 collections]` | 从 `build` 开始，深度1 |
+
+##### 与 `--list-format` 的配合
+
+不同的输出格式都会使用 `scoped_collection` 作为起点：
+
+```python
+def list_flat(self) -> None:
+    pairs = self._make_pairs(self.scoped_collection)  # 使用 scoped_collection
+    self.display_with_columns(pairs=pairs)
+
+def list_nested(self) -> None:
+    pairs = self._make_pairs(self.scoped_collection)  # 使用 scoped_collection
+    self.display_with_columns(pairs=pairs, extra="'*' denotes collection defaults")
+
+def list_json(self) -> None:
+    coll = self.scoped_collection  # 使用 scoped_collection
+    data = coll.serialized()
+    print(json.dumps(data))
+```
+*invoke/program.py:817-909*
+
+---
+
+#### 本节核心结论
+
+| 问题 | 答案 |
+|------|------|
+| **默认值是什么？** | `self.scoped_collection = self.collection`（根集合），默认显示所有任务 |
+| **如何切换到子集合？** | `inv --list <namespace>` 时，通过 `subcollection_from_path()` 递归查找子集合，然后更新 `self.scoped_collection = sub` |
+| **对输出范围的影响？** | 所有输出方法都从 `scoped_collection` 开始递归，只显示该集合及其子集合的任务；任务名格式会添加前导点表示相对路径 |
+
+### 4.3 支持的输出格式
 
 | 格式 | 方法 | 说明 |
 |------|------|------|
@@ -423,7 +762,7 @@ def list_tasks(self) -> None:
 | `nested` | `list_nested()` | 树状结构，缩进显示层级 |
 | `json` | `list_json()` | JSON 格式输出 |
 
-### 4.3 核心生成方法：_make_pairs()
+### 4.4 核心生成方法：_make_pairs()
 
 这是生成任务列表的核心方法，支持递归和多种显示格式：
 
