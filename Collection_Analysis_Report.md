@@ -977,7 +977,73 @@ root.add_task(foo)
 | `inv foo` | `foo` |
 | `inv f` | `foo`（别名解析） |
 
-### 6.6 默认任务的查找
+### 6.6 别名解析机制
+
+**⚠️ 重要发现**：别名解析**不是单独的查找步骤**，而是由 `Lexicon`（继承自 `AliasDict`）的 `__getitem__` 和 `__contains__` 方法**透明完成**的。
+
+从 `alias_dict.py` 的实现可以看到：
+
+```python
+def __getitem__(self, key):
+    def single(d, target, value):
+        return d[target]  # 返回真正的目标键的值
+    
+    def unaliased(d, key, value):
+        return super(AliasDict, d).__getitem__(key)
+    
+    def multi(d, target, value):
+        raise ValueError("Multi-target aliases can't be read.")
+    
+    return self._handle(key, None, single, multi, unaliased)
+
+def __contains__(self, key):
+    def single(d, target, value):
+        return target in d  # 检查真正的目标键是否存在
+    
+    def multi(d, target, value):
+        return all(subkey in self for subkey in self.aliases[key])
+    
+    def unaliased(d, key, value):
+        return super(AliasDict, d).__contains__(key)
+    
+    return self._handle(key, None, single, multi, unaliased)
+
+def _handle(self, key, value, single, multi, unaliased):
+    # 首先检查 key 是否在 aliases 中
+    if key in getattr(self, "aliases", {}):
+        target = self.aliases[key]
+        if isinstance(target, str):
+            return single(self, target, value)  # 用目标键执行操作
+        # ... 多目标处理
+    else:
+        return unaliased(self, key, value)
+```
+*invoke/vendor/lexicon/alias_dict.py:63-86*
+
+**别名解析的时机**：
+
+| 操作 | 别名解析发生的位置 | 行为 |
+|------|-------------------|------|
+| `self.tasks[name]` | `__getitem__` → `_handle` | 如果是别名，自动解析为目标键并返回其值 |
+| `name in self.tasks` | `__contains__` → `_handle` | 如果是别名，检查目标键是否存在 |
+| `self.tasks.get(name)` | 继承自 `dict`，**不考虑别名** | ⚠️ 注意：这个方法**不会**解析别名 |
+
+**对查找流程的影响**：
+
+当查找任务时：
+
+```python
+# 步骤：检查是否在 collections 中
+if name in self.collections:  # __contains__ 会自动解析别名！
+    return self._task_with_merged_config(name, "", ours)
+
+# 步骤：检查是否在 tasks 中
+return self.tasks[name]  # __getitem__ 会自动解析别名！
+```
+
+**关键结论**：别名解析在查找的**每一步**都已经透明发生，不需要单独的"别名解析"步骤。
+
+### 6.7 默认任务的查找
 
 默认任务有两种访问方式：
 
@@ -1004,17 +1070,18 @@ root.add_collection(build)
 | `inv build` | `build.compile`（默认任务） |
 | `inv build.compile` | `build.compile` |
 
-### 6.7 查找优先级总结
+### 6.8 查找优先级总结
 
-| 优先级 | 查找类型 | 说明 |
-|--------|----------|------|
-| 1 | 显式默认任务 | `collection[""]` 或 `collection[None]` |
-| 2 | 嵌套路径（带点号） | `sub.sub.task` → 逐级递归 |
-| 3 | 子集合默认任务 | 名称匹配 `collections` 中的键 |
-| 4 | 普通任务 | 名称匹配 `tasks` 中的键 |
-| 5 | 别名解析 | 上述都不匹配时，尝试别名 |
+| 优先级 | 查找类型 | 说明 | 别名解析时机 |
+|--------|----------|------|-------------|
+| 1 | 显式默认任务 | `name` 为空或 `None` → 检查 `self.default` | 不涉及 |
+| 2 | 嵌套路径（带点号） | `name` 包含 `.` → 递归查找子集合 | 不涉及（在子集合中查找时会透明解析） |
+| 3 | 子集合默认任务 | `name in self.collections` → 查找子集合的默认任务 | `__contains__` 自动解析 |
+| 4 | 普通任务 | `self.tasks[name]` → 直接返回 | `__getitem__` 自动解析 |
 
-### 6.8 潜在冲突场景
+**⚠️ 注意**：没有单独的"别名解析"步骤，因为 `Lexicon` 的 `__getitem__` 和 `__contains__` 已经在每次访问时自动处理了别名。
+
+### 6.9 潜在冲突场景
 
 虽然 Invoke 的设计避免了大多数冲突，但仍有一些需要注意的场景：
 
